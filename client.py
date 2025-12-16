@@ -1,9 +1,10 @@
 import libtorrent as lt
 import time
 from constants import TORRENT_FILE_NAME as FILE_NAME
+from datetime import datetime
 
 
-def download_torrent(settings):
+def download_torrent(settings, progress_callback=None, stop_event=None):
     session = lt.session()
     # standard ports for BitTorrent internet traffic
     session.listen_on(6881, 6891)
@@ -15,7 +16,11 @@ def download_torrent(settings):
     info = lt.torrent_info(FILE_NAME)
     torrent_handle = session.add_torrent(
         {'ti': info, 'save_path': './downloads'})
-    print(f"Starting download: {info.name()}")
+
+    # do not count time before connecting to the first seed
+    start_time = None
+    started = False
+    print(f"Starting download (waiting for seed): {info.name()}")
 
     # monitoring loop
 
@@ -24,16 +29,49 @@ def download_torrent(settings):
 
     try:
         while not torrent_handle.status().is_seeding:
-            status = torrent_handle.status()
-            sum_download_rate += status.download_rate
-            download_count += 1
+            # allow external cancellation
+            if stop_event is not None and getattr(stop_event, 'is_set', lambda: False)():
+                break
 
-            print(f'\r{status.progress * 100:.2f}% | '
-                  f'Down: {status.download_rate / 1000:.1f} kB/s | '
-                  f'Peers: {status.num_peers} | '
-                  f'Seeds: {status.num_seeds} | '
-                  f'State: {status.state} | ')
-            time.sleep(1)
+            status = torrent_handle.status()
+            # start timing and counting only after we see a seed
+            if not started and status.num_seeds > 0:
+                started = True
+                start_time = datetime.now()
+
+            if started:
+                sum_download_rate += status.download_rate
+                download_count += 1
+
+            # status dict for GUI consumers
+            time_spent = (
+                datetime.now() - start_time).total_seconds() if start_time is not None else 0
+            status_dict = {
+                'progress': status.progress,  # 0..1
+                'download_rate': status.download_rate,  # bytes/s
+                'num_peers': status.num_peers,
+                'num_seeds': status.num_seeds,
+                'state': str(status.state),
+                'total_done': status.total_done,
+                'total_time': time_spent,
+            }
+
+            # print to console as before
+            print(f"\r{status.progress * 100:.2f}% | "
+                  f"Down: {status.download_rate / 1000:.1f} kB/s | "
+                  f"Peers: {status.num_peers} | "
+                  f"Seeds: {status.num_seeds} | "
+                  f"State: {status.state} | ")
+
+            # emit progress for GUI
+            if progress_callback is not None:
+                try:
+                    progress_callback(status_dict)
+                except Exception:
+                    # swallow GUI callback errors to keep download running
+                    pass
+
+            time.sleep(0.1)
 
     except KeyboardInterrupt:
         print("\nAborted.")
@@ -43,7 +81,7 @@ def download_torrent(settings):
     data = {
         'average_download_rate_kB_s': (sum_download_rate / download_count) / 1000 if download_count > 0 else 0,
         'total_downloaded_bytes': torrent_handle.status().total_done,
-        'total_time_seconds': torrent_handle.status().total_time
+        'total_time_seconds': (datetime.now() - start_time).total_seconds() if start_time is not None else 0,
     }
     print(
         f"Average Download Rate: {data['average_download_rate_kB_s']:.2f} kB/s")
