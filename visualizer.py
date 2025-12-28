@@ -22,23 +22,31 @@ from PyQt5 import QtWidgets, QtCore
 import pyqtgraph as pg
 
 import client
+import os
+import shutil
+import time
 
 
 class DownloadWorker(threading.Thread):
-    def __init__(self, settings, progress_q, stop_event):
+    def __init__(self, progress_q, stop_event, serial=False):
         super().__init__(daemon=True)
-        self.settings = settings
         self.progress_q = progress_q
         self.stop_event = stop_event
+        self.serial = serial
 
     def run(self):
-        def cb(status):
-            # put status dict into queue for GUI thread
-            self.progress_q.put({'type': 'status', 'data': status})
+        # progress_callback expected by client.download_torrent_for_results
+        def cb(message):
+            # client will send dicts with 'type' key ('status'|'run_done')
+            try:
+                self.progress_q.put(message)
+            except Exception:
+                pass
 
         try:
-            result = client.download_torrent(
-                self.settings, progress_callback=cb, stop_event=self.stop_event)
+            result = client.download_torrent_for_results(
+                progress_callback=cb, stop_event=self.stop_event, serial=self.serial)
+            # result is a dict {'results': [...], 'filename': path}
             self.progress_q.put({'type': 'done', 'data': result})
         except Exception as e:
             self.progress_q.put({'type': 'error', 'data': str(e)})
@@ -77,6 +85,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.progress_label = QtWidgets.QLabel('Progress: 0.00%')
         self.rate_label = QtWidgets.QLabel('Rate: 0.0 kB/s')
         self.peers_label = QtWidgets.QLabel('Peers: 0')
+        # run counter label
+        self.run_label = QtWidgets.QLabel('Run: 0/0')
         # final summary labels (updated when download finishes)
         self.total_time_label = QtWidgets.QLabel('Total time: -')
         self.avg_rate_label = QtWidgets.QLabel('Avg rate: -')
@@ -84,6 +94,7 @@ class MainWindow(QtWidgets.QMainWindow):
         info_layout.addWidget(self.progress_label)
         info_layout.addWidget(self.rate_label)
         info_layout.addWidget(self.peers_label)
+        info_layout.addWidget(self.run_label)
         info_layout.addWidget(self.total_time_label)
         info_layout.addWidget(self.avg_rate_label)
         layout.addLayout(info_layout)
@@ -133,8 +144,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def start_download(self):
         mode = self.mode_combo.currentText()
-        settings = self._mode_settings(mode)
-
+        # visualizer delegates downloads and saving to client; only show data
         self.progress_q.queue.clear() if hasattr(self.progress_q, 'queue') else None
         self.x.clear()
         self.y_progress.clear()
@@ -143,9 +153,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.progress_curve.setData([], [])
         self.rate_curve.setData([], [])
 
+        serial = True if mode == 'serial' else False
+        total_runs = getattr(client, 'RUN_TIMES', '?')
+        self.run_label.setText(f'Run: 0/{total_runs}')
+
         self.stop_event = threading.Event()
         self.worker = DownloadWorker(
-            settings, self.progress_q, self.stop_event)
+            self.progress_q, self.stop_event, serial=serial)
         self.worker.start()
 
         self.start_btn.setEnabled(False)
@@ -165,6 +179,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 t = item.get('type')
                 if t == 'status':
                     s = item['data']
+                    run = item.get('run', 0)
+                    # update run label
+                    total_runs = getattr(client, 'RUN_TIMES', '?')
+                    self.run_label.setText(f'Run: {run}/{total_runs}')
+
                     self.sample_idx += 1
                     self.x.append(self.sample_idx)
                     self.y_progress.append(s['progress'] * 100)
@@ -181,9 +200,10 @@ class MainWindow(QtWidgets.QMainWindow):
                         f"Peers: {s['num_peers']} (Seeds: {s['num_seeds']})")
                     updated = True
 
-                elif t == 'done':
+                elif t == 'run_done':
+                    # one run finished; update final labels with this run's results
+                    run = item.get('run', 0)
                     data = item['data']
-                    # update final stats labels
                     total_time = data.get('total_time_seconds')
                     avg_rate = data.get('average_download_rate_kB_s')
                     if total_time is not None:
@@ -192,11 +212,34 @@ class MainWindow(QtWidgets.QMainWindow):
                     if avg_rate is not None:
                         self.avg_rate_label.setText(
                             f"Avg rate: {avg_rate:.2f} kB/s")
+                    # reset sample buffers for next run
+                    self.sample_idx = 0
+                    self.x.clear()
+                    self.y_progress.clear()
+                    self.y_rate.clear()
+                    self.progress_curve.setData([], [])
+                    self.rate_curve.setData([], [])
 
-                    QtWidgets.QMessageBox.information(
-                        self,
-                        'Done',
-                        f"Download finished. Total time: {total_time:.1f} s\nAvg rate: {avg_rate:.2f} kB/s")
+                elif t == 'done':
+                    # final summary (results written to file)
+                    payload = item['data']
+                    if isinstance(payload, dict) and 'filename' in payload:
+                        fname = payload['filename']
+                        QtWidgets.QMessageBox.information(
+                            self, 'All Runs Done', f"All runs finished. Results saved to: {fname}")
+                    else:
+                        # legacy single-run done
+                        data = payload
+                        total_time = data.get('total_time_seconds')
+                        avg_rate = data.get('average_download_rate_kB_s')
+                        if total_time is not None:
+                            self.total_time_label.setText(
+                                f"Total time: {total_time:.1f} s")
+                        if avg_rate is not None:
+                            self.avg_rate_label.setText(
+                                f"Avg rate: {avg_rate:.2f} kB/s")
+                        QtWidgets.QMessageBox.information(
+                            self, 'Done', f"Download finished. Total time: {total_time:.1f} s\nAvg rate: {avg_rate:.2f} kB/s")
                     self._finish()
                     return
                 elif t == 'error':
