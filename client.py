@@ -21,8 +21,7 @@ def download_torrent(progress_callback=None, stop_event=None, serial: bool = Fal
         {'ti': info, 'save_path': './downloads'})
 
     # do not count time before connecting to the first seed
-    start_time = None
-    started = False
+    start_time = datetime.now()
 
     if serial:
         torrent_handle.set_sequential_download(True)
@@ -43,16 +42,8 @@ def download_torrent(progress_callback=None, stop_event=None, serial: bool = Fal
                 break
 
             status = torrent_handle.status()
-            # start timing and counting only after we see a seed
-            if not started and status.num_seeds > 0:
-                started = True
-                start_time = datetime.now()
-                print(
-                    "Connected to seed, starting download. Start time is - ", start_time)
-
-            if started:
-                sum_download_rate += status.download_rate
-                download_count += 1
+            sum_download_rate += status.download_rate
+            download_count += 1
 
             # status dict for GUI consumers
             time_spent = (
