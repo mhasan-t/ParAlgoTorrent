@@ -10,9 +10,11 @@ import warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 
-def download_torrent(progress_callback=None, stop_event=None, serial: bool = False):
-    print("Initializing download with serial:", serial)
-    clear_downloads()
+def download_torrent(progress_callback=None, stop_event=None, serial: bool = False, save_path: str = './downloads', title: str = None):
+    print("Initializing download with serial:",
+          serial, "-> save_path:", save_path)
+    # ensure the target save directory exists (do not clear here; caller manages clearing)
+    os.makedirs(save_path, exist_ok=True)
     session = lt.session()
     # standard ports for BitTorrent internet traffic
     session.listen_on(6881, 6891)
@@ -24,7 +26,7 @@ def download_torrent(progress_callback=None, stop_event=None, serial: bool = Fal
     # add the torrent
     info = lt.torrent_info(FILE_NAME)
     torrent_handle = session.add_torrent(
-        {'ti': info, 'save_path': './downloads'})
+        {'ti': info, 'save_path': save_path})
 
     # do not count time before connecting to the first seed
     start_time = datetime.now()
@@ -34,7 +36,8 @@ def download_torrent(progress_callback=None, stop_event=None, serial: bool = Fal
     else:
         torrent_handle.set_sequential_download(False)
 
-    print(f"Starting download (waiting for seed): {info.name()}")
+    print(
+        f"Starting download (waiting for seed): {info.name()} -> {save_path}")
 
     # monitoring loop
 
@@ -66,6 +69,7 @@ def download_torrent(progress_callback=None, stop_event=None, serial: bool = Fal
 
             # print to console as before
             print(f"\r{status.progress * 100:.2f}% | "
+                  f"Title: {title} | "
                   f"Down: {status.download_rate / 1000:.1f} kB/s | "
                   f"Peers: {status.num_peers} | "
                   f"Seeds: {status.num_seeds} | "
@@ -79,7 +83,7 @@ def download_torrent(progress_callback=None, stop_event=None, serial: bool = Fal
                     # swallow GUI callback errors to keep download running
                     pass
 
-            time.sleep(0.1)
+            time.sleep(10)
 
     except KeyboardInterrupt:
         print("\nAborted.")
@@ -95,6 +99,52 @@ def download_torrent(progress_callback=None, stop_event=None, serial: bool = Fal
         f"Average Download Rate: {data['average_download_rate_kB_s']:.2f} kB/s")
 
     return data
+
+
+class TorrentProcess(multiprocessing.Process):
+    """A Process wrapper that runs `download_torrent` in a separate process.
+
+    Usage:
+        q = multiprocessing.Queue()
+        p = TorrentProcess(result_queue=q)
+        p.start()
+        p.join()
+        result = q.get()  # dict returned from download_torrent
+    """
+
+    def __init__(self, result_queue: multiprocessing.Queue = None,
+                 progress_callback=None, stop_event=None, serial: bool = False,
+                 save_path: str = None):
+        super().__init__()
+        self.result_queue = result_queue
+        self.progress_callback = progress_callback
+        self.stop_event = stop_event
+        # The class will force serial=False when calling download_torrent
+        # per the user's request. We still accept the param for API parity.
+        self.serial = False
+        # save_path for this process; if not provided, default to './downloads'
+        self.save_path = save_path or './downloads'
+
+    def run(self):
+        try:
+            result = download_torrent(progress_callback=self.progress_callback,
+                                      stop_event=self.stop_event,
+                                      serial=self.serial,
+                                      save_path=self.save_path)
+            if self.result_queue is not None:
+                try:
+                    self.result_queue.put(result)
+                except Exception:
+                    # last-resort: swallow queue errors to avoid crashing the child
+                    pass
+        except Exception as e:
+            # If something goes wrong, put an error dict into the queue if available
+            err = {'error': str(e)}
+            if self.result_queue is not None:
+                try:
+                    self.result_queue.put(err)
+                except Exception:
+                    pass
 
 
 def get_settings_options(serial: bool):
@@ -124,6 +174,12 @@ def download_torrent_for_results(progress_callback=None, stop_event=None, serial
     import time as _time
     all_results = []
 
+    # prepare a fresh parent directory for the per-run downloads
+    timestamp = int(_time.time())
+    base_download_dir = f"./downloads/runs_{timestamp}"
+    clear_downloads()
+    os.makedirs(base_download_dir, exist_ok=True)
+
     for run in range(RUN_TIMES):
         run_idx = run + 1
         print(f"\n--- Run {run_idx} of {RUN_TIMES} ---")
@@ -137,8 +193,12 @@ def download_torrent_for_results(progress_callback=None, stop_event=None, serial
                 except Exception:
                     pass
 
+        # per-run save path ensures each run writes to its own folder
+        save_path = os.path.join(base_download_dir, f"run_{run_idx}")
+        os.makedirs(save_path, exist_ok=True)
+
         result = download_torrent(
-            progress_callback=_inner_cb, stop_event=stop_event, serial=serial)
+            progress_callback=_inner_cb, stop_event=stop_event, serial=serial, save_path=save_path)
 
         all_results.append(result)
 
@@ -155,12 +215,10 @@ def download_torrent_for_results(progress_callback=None, stop_event=None, serial
             break
 
     # write results to results/<timestamp>_mode.csv
-    timestamp = int(_time.time())
     mode_name = 'serial' if serial else 'parallel'
     filename = f"{timestamp}_{mode_name}.csv"
     results_dir = './results'
     try:
-        import os
         os.makedirs(results_dir, exist_ok=True)
         filepath = os.path.join(results_dir, filename)
         with open(filepath, 'w') as fh:
@@ -173,7 +231,7 @@ def download_torrent_for_results(progress_callback=None, stop_event=None, serial
         filepath = None
         print(f"Failed to write results file: {e}")
 
-    return {'results': all_results, 'filename': filepath}
+    return {'results': all_results, 'filename': filepath, 'base_download_dir': base_download_dir}
 
 
 def clear_downloads():
@@ -323,35 +381,81 @@ def download_torrents_parallel(num_torrents: int, num_cores: int, serial: bool =
     return {'results': results, 'base_dir': base_results_dir, 'summary': summary}
 
 
+def download_torrents_process_parallel(serial: bool = False):
+    num_runs = RUN_TIMES
+    import time as _time
+    from multiprocessing import Queue
+
+    timestamp = int(_time.time())
+    base_download_dir = f"./downloads/process_runs_{timestamp}"
+
+    # clear previous downloads and create the base dir
+    clear_downloads()
+    os.makedirs(base_download_dir, exist_ok=True)
+
+    result_queue = Queue()
+    processes = []
+
+    for i in range(num_runs):
+        save_path = os.path.join(base_download_dir, f"run_{i+1}")
+        os.makedirs(save_path, exist_ok=True)
+        p = TorrentProcess(result_queue=result_queue, progress_callback=None,
+                           stop_event=None, serial=serial, save_path=save_path)
+        processes.append(p)
+
+    # start all processes
+    for p in processes:
+        p.start()
+
+    # wait for all to finish
+    for p in processes:
+        p.join()
+
+    # collect results from the queue
+    results = []
+    while not result_queue.empty():
+        try:
+            results.append(result_queue.get_nowait())
+        except Exception:
+            break
+
+    # If some processes didn't put a result, add placeholders
+    if len(results) < num_runs:
+        missing = num_runs - len(results)
+        for _ in range(missing):
+            results.append({'error': 'no result (process may have crashed)'})
+
+    # write single CSV
+    results_dir = './results'
+    os.makedirs(results_dir, exist_ok=True)
+    filename = f"{timestamp}_process_parallel.csv"
+    filepath = os.path.join(results_dir, filename)
+    try:
+        with open(filepath, 'w') as fh:
+            fh.write(
+                'run,total_time_seconds,average_download_rate_kB_s,total_downloaded_bytes,save_path\n')
+            for i, r in enumerate(results, start=1):
+                fh.write(
+                    f"{i},{r.get('total_time_seconds', '')},{r.get('average_download_rate_kB_s', '')},{r.get('total_downloaded_bytes', '')},{r.get('save_path', '')}\n")
+    except Exception as e:
+        filepath = None
+        print(f"Failed to write process-parallel CSV: {e}")
+
+    return {'results': results, 'filename': filepath, 'base_download_dir': base_download_dir}
+
+
 if __name__ == "__main__":
     input_mode = input(
         "Enter 'p' for single parallel download, 's' for single serial download, or 'cp' to download X torrents using CPU cores: ").strip().lower()
     if input_mode == 'p':
+        clear_downloads()
         download_torrent(serial=False)
     elif input_mode == 's':
+        clear_downloads()
         download_torrent(serial=True)
     elif input_mode == 'cp':
-        num_cores = min(NUM_CORES, multiprocessing.cpu_count())
-        num_torrents = RUN_TIMES
-        print(f"Starting {num_torrents} downloads using {num_cores} cores...")
-        result = download_torrents_parallel(
-            num_torrents=num_torrents, num_cores=num_cores)
-
-        # export aggregated summary to CSV
-        try:
-            summary = result.get('summary', {})
-            timestamp = int(time.time())
-            filename = f"{timestamp}_cpu-parallel-summary.csv"
-            results_dir = './results'
-            os.makedirs(results_dir, exist_ok=True)
-            filepath = os.path.join(results_dir, filename)
-            with open(filepath, 'w') as fh:
-                fh.write(
-                    'total_time_seconds,average_download_rate_kB_s,total_downloaded_bytes,base_dir,num_torrents,num_cores\n')
-                fh.write(f"{summary.get('total_time_seconds', 0)},{summary.get('average_download_rate_kB_s', 0)},{summary.get('total_downloaded_bytes', 0)},{summary.get('base_dir', '')},{summary.get('num_torrents', 0)},{summary.get('num_cores', 0)}\n")
-            print(f"Summary results written to: {filepath}")
-        except Exception as e:
-            print(f"Failed to write summary results file: {e}")
+        clear_downloads()
+        download_torrents_process_parallel()
 
     else:
         print("Invalid input. Please enter 'p', 's', or 'cp'.")
