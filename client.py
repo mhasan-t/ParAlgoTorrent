@@ -170,6 +170,140 @@ def download_torrent_for_results(progress_callback=None, stop_event=None, serial
     return {'results': all_results, 'filename': filepath}
 
 
+def download_torrent_full_parallel(progress_callback=None, stop_event=None):
+    """Download the same torrent `RUN_TIMES` times in parallel using a single
+    libtorrent session. Each run is saved into its own folder under `./downloads/run_<i>`.
+    Returns a dict with per-run results and the CSV filepath (same columns as
+    `download_torrent_for_results`).
+    """
+    import time as _time
+    import os
+
+    clear_downloads()
+
+    session = lt.session()
+    session.listen_on(6881, 6891)
+
+    # apply parallel settings
+    settings = get_settings_options(False)
+    session.apply_settings(settings)
+
+    info = lt.torrent_info(FILE_NAME)
+
+    # prepare per-run folders and add torrent handles
+    handles = []
+    for i in range(1, RUN_TIMES + 1):
+        save_path = os.path.join('downloads', f'run_{i}')
+        os.makedirs(save_path, exist_ok=True)
+        th = session.add_torrent({'ti': info, 'save_path': save_path})
+        # ensure parallel (non-sequential) behavior
+        try:
+            th.set_sequential_download(False)
+        except Exception:
+            pass
+        handles.append(th)
+
+    # tracking arrays
+    sum_download_rate = [0] * RUN_TIMES
+    download_count = [0] * RUN_TIMES
+    finished = [False] * RUN_TIMES
+    finish_time = [None] * RUN_TIMES
+    total_done = [0] * RUN_TIMES
+
+    start_time = datetime.now()
+
+    try:
+        # monitor until all handles are seeding
+        while not all(finished):
+            # allow external cancellation
+            if stop_event is not None and getattr(stop_event, 'is_set', lambda: False)():
+                break
+
+            for idx, th in enumerate(handles):
+                try:
+                    status = th.status()
+                except Exception:
+                    # if a handle becomes invalid, mark finished and continue
+                    if not finished[idx]:
+                        finished[idx] = True
+                        finish_time[idx] = (
+                            datetime.now() - start_time).total_seconds()
+                    continue
+
+                if not finished[idx]:
+                    sum_download_rate[idx] += status.download_rate
+                    download_count[idx] += 1
+
+                    # if this handle finished, record finish time and total
+                    if status.is_seeding:
+                        finished[idx] = True
+                        finish_time[idx] = (
+                            datetime.now() - start_time).total_seconds()
+                        total_done[idx] = status.total_done
+
+                # emit per-run status for GUI consumers
+                status_dict = {
+                    'progress': status.progress,
+                    'download_rate': status.download_rate,
+                    'num_peers': status.num_peers,
+                    'num_seeds': status.num_seeds,
+                    'state': str(status.state),
+                    'total_done': status.total_done,
+                    'total_time': (datetime.now() - start_time).total_seconds(),
+                }
+                if progress_callback is not None:
+                    try:
+                        progress_callback(
+                            {'type': 'status', 'data': status_dict, 'run': idx + 1})
+                    except Exception:
+                        pass
+
+            time.sleep(0.1)
+
+    except KeyboardInterrupt:
+        print("\nAborted.")
+
+    # when loop exits, compute overall finish time (wall-clock until all finished)
+    if any(t is None for t in finish_time):
+        # not all finished; use elapsed time
+        all_finished_time = (datetime.now() - start_time).total_seconds()
+    else:
+        # all finished; the overall time is the max individual finish time
+        all_finished_time = max(finish_time) if finish_time else (
+            datetime.now() - start_time).total_seconds()
+
+    # gather final per-run results
+    results = []
+    for i in range(RUN_TIMES):
+        avg_rate = (sum_download_rate[i] / download_count[i]
+                    ) / 1000 if download_count[i] > 0 else 0
+        t_done = total_done[i]
+        t_time = finish_time[i] if finish_time[i] is not None else (
+            datetime.now() - start_time).total_seconds()
+        results.append({'run': i + 1, 'total_time_seconds': t_time,
+                        'average_download_rate_kB_s': avg_rate, 'total_downloaded_bytes': t_done,
+                        'all_finished_time_seconds': all_finished_time})
+
+    # write results to CSV like the other helper, with an extra column for overall parallel finish time
+    timestamp = int(_time.time())
+    filename = f"{timestamp}_full_parallel.csv"
+    results_dir = './results'
+    try:
+        os.makedirs(results_dir, exist_ok=True)
+        filepath = os.path.join(results_dir, filename)
+        with open(filepath, 'w') as fh:
+            fh.write(
+                'run,total_time_seconds,average_download_rate_kB_s,total_downloaded_bytes,all_finished_time_seconds\n')
+            for r in results:
+                fh.write(
+                    f"{r['run']},{r['total_time_seconds']},{r['average_download_rate_kB_s']},{r['total_downloaded_bytes']},{r['all_finished_time_seconds']}\n")
+    except Exception as e:
+        filepath = None
+        print(f"Failed to write results file: {e}")
+
+    return {'results': results, 'filename': filepath, 'all_finished_time_seconds': all_finished_time}
+
+
 def clear_downloads():
     import os
     import shutil
@@ -183,11 +317,14 @@ def clear_downloads():
 
 
 if __name__ == "__main__":
+    clear_downloads()
     input_mode = input(
-        "Enter 'p' for parallel download or 's' for serial download: ").strip().lower()
+        "Enter 'p' for parallel download or 's' for serial download, or 'fp' for full parallel download: ").strip().lower()
     if input_mode == 'p':
         download_torrent(serial=False)
     elif input_mode == 's':
         download_torrent(serial=True)
+    elif input_mode == 'fp':
+        download_torrent_full_parallel()
     else:
         print("Invalid input. Please enter 'p' or 's'.")
