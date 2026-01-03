@@ -52,35 +52,14 @@ python3 -m pip install -r requirements.txt
 python3 visualizer.py
 ```
 
-You can also run the `client.py` from terminal if you prefer.
-
 Usage
 
 - Choose `parallel`, `serial`, or the new `full-parallel` mode.
 - Click `Start` to begin. The GUI will plot progress (%) and download rate (kB/s).
 - Click `Stop` to request cancellation.
 
-New features
 
-- `full-parallel` mode: starts `RUN_TIMES` downloads concurrently using a single `libtorrent` session. Each run receives its own save directory under `./downloads/run_<i>` to avoid conflicts.
-- Results for the full-parallel run are written to `./results/<timestamp>_full_parallel.csv` and include a new column `all_finished_time_seconds`, which is the wall-clock time until all parallel downloads completed (not a sum of per-run times).
-
-CSV format (full-parallel)
-
-- `run`: run index (1..RUN_TIMES)
-- `total_time_seconds`: time that particular run took (seconds)
-- `average_download_rate_kB_s`: per-run average download rate (kB/s)
-- `total_downloaded_bytes`: bytes downloaded for the run
-- `all_finished_time_seconds`: wall-clock seconds until all runs finished (same value repeated on every row)
-
-Programmatic usage
-
-```python
-from client import download_torrent_full_parallel
-res = download_torrent_full_parallel()
-print(res['filename'])
-print('Wall-clock until all finished:', res.get('all_finished_time_seconds'))
-```
+You can also run the `client.py` from terminal if you prefer.
 
 GUI notes
 
