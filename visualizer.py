@@ -28,10 +28,11 @@ import time
 
 
 class DownloadWorker(threading.Thread):
-    def __init__(self, progress_q, stop_event, serial=False):
+    def __init__(self, progress_q, stop_event, mode='parallel', serial=False):
         super().__init__(daemon=True)
         self.progress_q = progress_q
         self.stop_event = stop_event
+        self.mode = mode
         self.serial = serial
 
     def run(self):
@@ -44,8 +45,13 @@ class DownloadWorker(threading.Thread):
                 pass
 
         try:
-            result = client.download_torrent_for_results(
-                progress_callback=cb, stop_event=self.stop_event, serial=self.serial)
+            # choose function based on requested mode
+            if getattr(self, 'mode', 'parallel') == 'full-parallel':
+                result = client.download_torrent_full_parallel(
+                    progress_callback=cb, stop_event=self.stop_event)
+            else:
+                result = client.download_torrent_for_results(
+                    progress_callback=cb, stop_event=self.stop_event, serial=self.serial)
             # result is a dict {'results': [...], 'filename': path}
             self.progress_q.put({'type': 'done', 'data': result})
         except Exception as e:
@@ -65,7 +71,8 @@ class MainWindow(QtWidgets.QMainWindow):
         # Controls
         ctrl_layout = QtWidgets.QHBoxLayout()
         self.mode_combo = QtWidgets.QComboBox()
-        self.mode_combo.addItems(['parallel', 'serial'])
+        # add new full-parallel mode option
+        self.mode_combo.addItems(['parallel', 'serial', 'full-parallel'])
         ctrl_layout.addWidget(QtWidgets.QLabel('Mode:'))
         ctrl_layout.addWidget(self.mode_combo)
 
@@ -158,8 +165,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.run_label.setText(f'Run: 0/{total_runs}')
 
         self.stop_event = threading.Event()
+        mode = self.mode_combo.currentText()
         self.worker = DownloadWorker(
-            self.progress_q, self.stop_event, serial=serial)
+            self.progress_q, self.stop_event, mode=mode, serial=serial)
         self.worker.start()
 
         self.start_btn.setEnabled(False)
