@@ -109,8 +109,6 @@ def get_settings_options(serial: bool):
             'enable_dht': True,
             'enable_upnp': True,
             'enable_natpmp': True,
-            'connections_limit': 10,
-            'max_out_request_queue': 1,  # per peer
         }
 
 
