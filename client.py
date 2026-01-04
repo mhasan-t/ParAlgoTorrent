@@ -321,9 +321,9 @@ if __name__ == "__main__":
     input_mode = input(
         "Enter 'p' for parallel download or 's' for serial download, or 'fp' for full parallel download: ").strip().lower()
     if input_mode == 'p':
-        download_torrent(serial=False)
+        download_torrent_for_results(serial=False)
     elif input_mode == 's':
-        download_torrent(serial=True)
+        download_torrent_for_results(serial=True)
     elif input_mode == 'fp':
         download_torrent_full_parallel()
     else:
