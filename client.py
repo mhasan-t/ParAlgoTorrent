@@ -30,10 +30,108 @@ def download_torrent(progress_callback=None, stop_event=None, serial: bool = Fal
 
     print(f"Starting download (waiting for seed): {info.name()}")
 
+    # helper: safe attribute access and metric extraction
+    def _safe_get(obj, *names):
+        for n in names:
+            try:
+                if hasattr(obj, n):
+                    v = getattr(obj, n)
+                    # call if callable (some properties may be methods)
+                    try:
+                        if callable(v):
+                            v = v()
+                    except Exception:
+                        pass
+                    return v
+            except Exception:
+                continue
+        return None
+
+    def _extract_metrics(info_obj, status_obj):
+        # total seeds and connected nodes (best-effort)
+        total_seeds = _safe_get(status_obj, 'num_seeds', 'num_complete')
+        total_connected = _safe_get(status_obj, 'num_peers', 'num_connections')
+
+        # trackers from torrent_info if available
+        trackers = None
+        try:
+            if info_obj is not None:
+                # torrent_info.trackers() may return a list of tracker_entry
+                tlist = _safe_get(info_obj, 'trackers')
+                if callable(tlist):
+                    try:
+                        tlist = tlist()
+                    except Exception:
+                        pass
+                if isinstance(tlist, (list, tuple)):
+                    # try to extract `url` attribute if present
+                    trackers = []
+                    for te in tlist:
+                        try:
+                            if hasattr(te, 'url'):
+                                trackers.append(str(getattr(te, 'url')))
+                            else:
+                                trackers.append(str(te))
+                        except Exception:
+                            trackers.append(str(te))
+        except Exception:
+            trackers = None
+
+        trackers_count = len(trackers) if isinstance(
+            trackers, (list, tuple)) else None
+
+        # info hash (best-effort)
+        info_hash = None
+        try:
+            if info_obj is not None and hasattr(info_obj, 'info_hash'):
+                ih = info_obj.info_hash()
+                try:
+                    # sha1_hash objects often have to_string()
+                    info_hash = ih.to_string()
+                except Exception:
+                    info_hash = str(ih)
+        except Exception:
+            info_hash = None
+
+        # loss / redownloads (best-effort from available attributes)
+        total_failed_bytes = _safe_get(
+            status_obj, 'total_failed_bytes', 'total_failed')
+        total_redundant_bytes = _safe_get(
+            status_obj, 'total_redundant_bytes', 'total_redundant')
+        total_done = _safe_get(status_obj, 'total_done', 'total_wanted_done')
+
+        loss = None
+        if total_failed_bytes is not None and total_done is not None:
+            try:
+                denom = float(total_failed_bytes) + float(total_done)
+                loss = float(total_failed_bytes) / denom if denom > 0 else 0.0
+            except Exception:
+                loss = None
+
+        redownloads = None
+        if total_redundant_bytes is not None:
+            try:
+                redownloads = int(total_redundant_bytes)
+            except Exception:
+                redownloads = None
+
+        return {
+            'total_seeds': total_seeds,
+            'trackers': trackers,
+            'trackers_count': trackers_count,
+            'total_connected_nodes': total_connected,
+            'info_hash': info_hash,
+            'loss': loss,
+            'redownloads': redownloads,
+        }
+
     # monitoring loop
 
     sum_download_rate = 0
     download_count = 0
+    sum_seeds = 0
+    sum_peers = 0
+    last_metrics = {}
 
     try:
         while not torrent_handle.status().is_seeding:
@@ -44,6 +142,21 @@ def download_torrent(progress_callback=None, stop_event=None, serial: bool = Fal
             status = torrent_handle.status()
             sum_download_rate += status.download_rate
             download_count += 1
+            # aggregate seeds & peers for simple averages
+            try:
+                sum_seeds += int(getattr(status, 'num_seeds', 0) or 0)
+            except Exception:
+                pass
+            try:
+                sum_peers += int(getattr(status, 'num_peers', 0) or 0)
+            except Exception:
+                pass
+
+            # extract extra metrics (best-effort)
+            try:
+                last_metrics = _extract_metrics(info, status)
+            except Exception:
+                last_metrics = {}
 
             # status dict for GUI consumers
             time_spent = (
@@ -57,6 +170,10 @@ def download_torrent(progress_callback=None, stop_event=None, serial: bool = Fal
                 'total_done': status.total_done,
                 'total_time': time_spent,
             }
+
+            # merge extracted metrics into status dict
+            if last_metrics:
+                status_dict.update(last_metrics)
 
             # print to console as before
             print(f"\r{status.progress * 100:.2f}% | "
@@ -84,6 +201,10 @@ def download_torrent(progress_callback=None, stop_event=None, serial: bool = Fal
         'average_download_rate_kB_s': (sum_download_rate / download_count) / 1000 if download_count > 0 else 0,
         'total_downloaded_bytes': torrent_handle.status().total_done,
         'total_time_seconds': (datetime.now() - start_time).total_seconds() if start_time is not None else 0,
+        # aggregated averages and last-observed metrics
+        'average_seeds': (sum_seeds / download_count) if download_count > 0 else None,
+        'average_peers': (sum_peers / download_count) if download_count > 0 else None,
+        'last_metrics': last_metrics,
     }
     print(
         f"Average Download Rate: {data['average_download_rate_kB_s']:.2f} kB/s")
@@ -157,10 +278,11 @@ def download_torrent_for_results(progress_callback=None, stop_event=None, serial
         filepath = os.path.join(results_dir, filename)
         with open(filepath, 'w') as fh:
             fh.write(
-                'run,total_time_seconds,average_download_rate_kB_s,total_downloaded_bytes\n')
+                'run,total_time_seconds,average_download_rate_kB_s,total_downloaded_bytes,average_seeds,average_peers,info_hash,trackers_count,loss,redownloads\n')
             for i, r in enumerate(all_results, start=1):
+                lm = r.get('last_metrics', {}) if isinstance(r, dict) else {}
                 fh.write(
-                    f"{i},{r.get('total_time_seconds', 0)},{r.get('average_download_rate_kB_s', 0)},{r.get('total_downloaded_bytes', 0)}\n")
+                    f"{i},{r.get('total_time_seconds', 0)},{r.get('average_download_rate_kB_s', 0)},{r.get('total_downloaded_bytes', 0)},{r.get('average_seeds', '')},{r.get('average_peers', '')},{lm.get('info_hash', '')},{lm.get('trackers_count', '')},{lm.get('loss', '')},{lm.get('redownloads', '')}\n")
     except Exception as e:
         filepath = None
         print(f"Failed to write results file: {e}")
@@ -204,6 +326,9 @@ def download_torrent_full_parallel(progress_callback=None, stop_event=None):
     # tracking arrays
     sum_download_rate = [0] * RUN_TIMES
     download_count = [0] * RUN_TIMES
+    sum_seeds = [0] * RUN_TIMES
+    sum_peers = [0] * RUN_TIMES
+    last_metrics_list = [None] * RUN_TIMES
     finished = [False] * RUN_TIMES
     finish_time = [None] * RUN_TIMES
     total_done = [0] * RUN_TIMES
@@ -231,6 +356,106 @@ def download_torrent_full_parallel(progress_callback=None, stop_event=None):
                 if not finished[idx]:
                     sum_download_rate[idx] += status.download_rate
                     download_count[idx] += 1
+                    try:
+                        sum_seeds[idx] += int(getattr(status,
+                                              'num_seeds', 0) or 0)
+                    except Exception:
+                        pass
+                    try:
+                        sum_peers[idx] += int(getattr(status,
+                                              'num_peers', 0) or 0)
+                    except Exception:
+                        pass
+
+                    # extract additional metrics (best-effort)
+                    try:
+                        def _safe_get(obj, *names):
+                            for n in names:
+                                try:
+                                    if hasattr(obj, n):
+                                        v = getattr(obj, n)
+                                        try:
+                                            if callable(v):
+                                                v = v()
+                                        except Exception:
+                                            pass
+                                        return v
+                                except Exception:
+                                    continue
+                            return None
+
+                        def _extract_metrics(info_obj, status_obj):
+                            trackers = None
+                            try:
+                                tlist = _safe_get(info_obj, 'trackers')
+                                if callable(tlist):
+                                    try:
+                                        tlist = tlist()
+                                    except Exception:
+                                        pass
+                                if isinstance(tlist, (list, tuple)):
+                                    trackers = []
+                                    for te in tlist:
+                                        try:
+                                            if hasattr(te, 'url'):
+                                                trackers.append(
+                                                    str(getattr(te, 'url')))
+                                            else:
+                                                trackers.append(str(te))
+                                        except Exception:
+                                            trackers.append(str(te))
+                            except Exception:
+                                trackers = None
+
+                            trackers_count = len(trackers) if isinstance(
+                                trackers, (list, tuple)) else None
+
+                            info_hash = None
+                            try:
+                                if info_obj is not None and hasattr(info_obj, 'info_hash'):
+                                    ih = info_obj.info_hash()
+                                    try:
+                                        info_hash = ih.to_string()
+                                    except Exception:
+                                        info_hash = str(ih)
+                            except Exception:
+                                info_hash = None
+
+                            total_failed_bytes = _safe_get(
+                                status_obj, 'total_failed_bytes', 'total_failed')
+                            total_redundant_bytes = _safe_get(
+                                status_obj, 'total_redundant_bytes', 'total_redundant')
+                            total_done = _safe_get(
+                                status_obj, 'total_done', 'total_wanted_done')
+
+                            loss = None
+                            if total_failed_bytes is not None and total_done is not None:
+                                try:
+                                    denom = float(
+                                        total_failed_bytes) + float(total_done)
+                                    loss = float(total_failed_bytes) / \
+                                        denom if denom > 0 else 0.0
+                                except Exception:
+                                    loss = None
+
+                            redownloads = None
+                            if total_redundant_bytes is not None:
+                                try:
+                                    redownloads = int(total_redundant_bytes)
+                                except Exception:
+                                    redownloads = None
+
+                            return {
+                                'trackers': trackers,
+                                'trackers_count': trackers_count,
+                                'info_hash': info_hash,
+                                'loss': loss,
+                                'redownloads': redownloads,
+                            }
+
+                        last_metrics_list[idx] = _extract_metrics(info, status)
+                    except Exception:
+                        last_metrics_list[idx] = last_metrics_list[idx] or {}
 
                     # if this handle finished, record finish time and total
                     if status.is_seeding:
@@ -278,8 +503,12 @@ def download_torrent_full_parallel(progress_callback=None, stop_event=None):
         t_done = total_done[i]
         t_time = finish_time[i] if finish_time[i] is not None else (
             datetime.now() - start_time).total_seconds()
+        lm = last_metrics_list[i] or {}
         results.append({'run': i + 1, 'total_time_seconds': t_time,
                         'average_download_rate_kB_s': avg_rate, 'total_downloaded_bytes': t_done,
+                        'average_seeds': (sum_seeds[i] / download_count[i]) if download_count[i] > 0 else None,
+                        'average_peers': (sum_peers[i] / download_count[i]) if download_count[i] > 0 else None,
+                        'last_metrics': lm,
                         'all_finished_time_seconds': all_finished_time})
 
     # write results to CSV like the other helper, with an extra column for overall parallel finish time
@@ -291,10 +520,11 @@ def download_torrent_full_parallel(progress_callback=None, stop_event=None):
         filepath = os.path.join(results_dir, filename)
         with open(filepath, 'w') as fh:
             fh.write(
-                'run,total_time_seconds,average_download_rate_kB_s,total_downloaded_bytes,all_finished_time_seconds\n')
+                'run,total_time_seconds,average_download_rate_kB_s,total_downloaded_bytes,average_seeds,average_peers,info_hash,trackers_count,loss,redownloads,all_finished_time_seconds\n')
             for r in results:
+                lm = r.get('last_metrics', {}) if isinstance(r, dict) else {}
                 fh.write(
-                    f"{r['run']},{r['total_time_seconds']},{r['average_download_rate_kB_s']},{r['total_downloaded_bytes']},{r['all_finished_time_seconds']}\n")
+                    f"{r['run']},{r['total_time_seconds']},{r['average_download_rate_kB_s']},{r['total_downloaded_bytes']},{r.get('average_seeds', '')},{r.get('average_peers', '')},{lm.get('info_hash', '')},{lm.get('trackers_count', '')},{lm.get('loss', '')},{lm.get('redownloads', '')},{r['all_finished_time_seconds']}\n")
     except Exception as e:
         filepath = None
         print(f"Failed to write results file: {e}")
